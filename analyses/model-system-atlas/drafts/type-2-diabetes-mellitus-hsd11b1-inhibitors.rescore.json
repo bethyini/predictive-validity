@@ -52,5 +52,30 @@
  },
  "leads": [
   "EU Clinical Trials Register results attachment for EudraCT 2008-001122-13 (Roche synopsis, protocol BP21850): a search snippet suggests the glucose comparisons were non-significant; automated download was blocked. If quotable, a redraft of efficacy 3 would likely be contra (headline unchanged)."
+ ],
+ "full_text_update": [
+  {
+   "date": "2026-11-23",
+   "cell": "efficacy",
+   "index": 3,
+   "what": "Redrafted from the full text: status same -> contra (primary endpoint MDPG not lowered), year 2013 -> 2014 (full-paper epub), quote, note, judgement, confidence low -> high; untested_reason removed. Replaces the adjudicated untested (unsettled) call, which rested on the abstract alone.",
+   "old": {
+    "year": 2013,
+    "status": "same",
+    "quote": "Despite the short treatment duration, both RO-151 and RO-838 showed trends for improved HbA1c and consistent reductions in body weight (-0.86 to -1.67 kg) exceeding those observed with placebo (-0.28 kg, p = 0.019 for 200 mg RO-151 vs. placebo).",
+    "note": "RO5093151 for 28 days in metformin-treated T2D: HbA1c trends, weight -1.67 kg (p=0.019), insulin sensitivity NS; registry primary (mean daily glucose) not in the abstract. Design: RO5093151 added to stable metformin, placebo-controlled; scored like any trial, metformin named as partner. Dated 2013: the trial's efficacy result (HbA1c tendency) was first public as an ADA congress abstract, Morrow L, Heise T et al., Diabetes 62 (Suppl. 1):A293, June 2013 (also EASD, Diabetologia 56 Suppl. 1:S407-8, 2013), cited in DeFronzo, Diabetes Spectrum 2014 (PMC4522879).",
+    "short": "Weight fell, HbA1c only trended at 4 weeks",
+    "judgement": "Same/partial on the authors' own wording ('slight metabolic improvements ... often did not reach statistical significance'); the alternative is contra on an unmet glucose primary, which the abstract does not state. Strengthens the 2013 entry rather than changing it.",
+    "confidence": "low",
+    "confidence_note": "Abstract only (paywalled); NCT00823680 lists 'absolute change in mean daily plasma glucose' as primary and posted no results, so whether the primary was met is unverified. No FDA review exists for this class (nothing approved), so model_filed cannot be read from a filing. Abstract-level reading.",
+    "endpoint_role": null,
+    "magnitude": "direction_only",
+    "magnitude_basis": "body weight and HbA1c direction; glucose profile result not available",
+    "source_calls_it": "partial",
+    "strengthens": true,
+    "untested_reason": "unsettled"
+   },
+   "source": "Heise 2014 full text (Diabetes Obes Metab 2014;16:1070-7, doi 10.1111/dom.12317), Methods and Table 1"
+  }
  ]
 }
