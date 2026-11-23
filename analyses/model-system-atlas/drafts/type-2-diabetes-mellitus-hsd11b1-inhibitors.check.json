@@ -76,13 +76,16 @@
   {
    "cell": "efficacy",
    "index": 3,
-   "verdict": "unverified",
+   "verdict": "corrected",
    "source_resolves": true,
    "quote_found": "abstract_only",
    "status_supported": false,
-   "rule": "DRAFTER_BRIEF rule 6 (earliest public date) and efficacy (primary endpoint governs)",
-   "note": "ADA 2013 abstract exists (Morrow, Diabetes 62 Suppl 1:A293; EASD Diabetologia 56 S407; Crossref refs of DeFronzo 2014) but its text was unreadable; Heise epub 2014-06-09 omits registry primary (mean daily glucose). 'same' rests on secondary HbA1c trend; earlier-cited 2015 Roche synopsis not re-opened.",
-   "checked_by": "CHECKER_BRIEF / dates"
+   "proposed_status": "untested",
+   "rule": "DRAFTER_BRIEF rule 3 (a status its quote cannot support is untested) and efficacy (the trial's primary endpoint governs); rule 5 untested_reason unsettled",
+   "note": "Registry primary (NCT00823680): change in mean daily plasma glucose to day 27, no results posted; the Heise 2014 abstract reports only secondary HbA1c trends and weight. Full text closed (Unpaywall, Europe PMC); ADA 2013 abstract unread. Untested, unsettled.",
+   "checked_by": "CHECKER_BRIEF / rescore audit",
+   "adjudicated_status": "untested",
+   "adjudication_note": "Efficacy rule (primary endpoint governs) and rule 3: the quote gives secondary HbA1c trends and weight; the registry primary, mean daily glucose, is unreported in the abstract and ClinicalTrials.gov (EU CTR synopsis unreadable here). Untested, unsettled."
   },
   {
    "cell": "efficacy",

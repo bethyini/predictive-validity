@@ -556,7 +556,8 @@
         "drug": "RO5093151",
         "route": "oral",
         "population_group": "unselected",
-        "combination_with": "metformin"
+        "combination_with": "metformin",
+        "untested_reason": "unsettled"
       },
       {
         "model_id": "dio-mouse",

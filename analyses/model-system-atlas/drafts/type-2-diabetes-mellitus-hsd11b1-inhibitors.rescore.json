@@ -1,0 +1,56 @@
+{
+ "tile": "type-2-diabetes-mellitus-hsd11b1-inhibitors",
+ "date": "2026-11-22",
+ "by": "rescore audit (Claude Code, for review)",
+ "why": "An atlas-wide audit (headlines recomputed as glance.py does, from the drafts and verdicts) found one cell whose headline rests only on an entry the checker could not support: this tile's efficacy cell (matched), set by efficacy 3. A verdict marked 'unverified' never reaches adjudication, so the drafter's status stood. Set aside, the headline would be contradicted (BI 187004 on the DIO-mouse and knockout-mouse tracks).",
+ "changed_verdicts": [
+  {
+   "cell": "efficacy",
+   "index": 3,
+   "old": {
+    "cell": "efficacy",
+    "index": 3,
+    "verdict": "unverified",
+    "source_resolves": true,
+    "quote_found": "abstract_only",
+    "status_supported": false,
+    "rule": "DRAFTER_BRIEF rule 6 (earliest public date) and efficacy (primary endpoint governs)",
+    "note": "ADA 2013 abstract exists (Morrow, Diabetes 62 Suppl 1:A293; EASD Diabetologia 56 S407; Crossref refs of DeFronzo 2014) but its text was unreadable; Heise epub 2014-06-09 omits registry primary (mean daily glucose). 'same' rests on secondary HbA1c trend; earlier-cited 2015 Roche synopsis not re-opened.",
+    "checked_by": "CHECKER_BRIEF / dates"
+   },
+   "new": "corrected, proposed untested (unsettled), for adjudication"
+  }
+ ],
+ "sources_opened": [
+  "ClinicalTrials.gov NCT00823680 (primary outcome; hasResults false)",
+  "Europe PMC core record for doi 10.1111/dom.12317 (PMID 24828020; abstract; not open access)",
+  "Unpaywall for doi 10.1111/dom.12317 (closed)",
+  "Web search for the primary-endpoint result (none found)"
+ ],
+ "rule_questions": [
+  "Should a verdict 'unverified' with status_supported false go to adjudication like a 'corrected' one? Today it leaves the drafter's status in the figure."
+ ],
+ "adjudicated": [
+  {
+   "cell": "efficacy",
+   "index": 3,
+   "drafter": "same",
+   "checker": "untested",
+   "adjudicated": "untested",
+   "why": "registry primary (mean daily plasma glucose) unreported; the abstract gives only HbA1c trends and weight (efficacy rule, rule 3)"
+  }
+ ],
+ "untested_reason_set": [
+  {
+   "cell": "efficacy",
+   "index": 3,
+   "value": "unsettled"
+  }
+ ],
+ "headline_effect": {
+  "efficacy": "same -> contra (BI 187004 on the DIO-mouse and knockout-mouse tracks)"
+ },
+ "leads": [
+  "EU Clinical Trials Register results attachment for EudraCT 2008-001122-13 (Roche synopsis, protocol BP21850): a search snippet suggests the glucose comparisons were non-significant; automated download was blocked. If quotable, a redraft of efficacy 3 would likely be contra (headline unchanged)."
+ ]
+}
