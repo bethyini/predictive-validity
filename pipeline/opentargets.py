@@ -4,6 +4,9 @@
     python -m pipeline.opentargets load   # release files in .cache/opentargets/<release>
     python -m pipeline.opentargets evidence  # evidence rows behind those associations, dated; mouse phenotypes
     python -m pipeline.opentargets dates     # re-date the rows from preclin.evidence_known_year, rebuild the series
+    python -m pipeline.opentargets pqtl      # cis-pQTLs colocalising with disease GWAS signals -> preclin.pqtl_coloc
+    python -m pipeline.opentargets adverse   # significant FAERS adverse reactions -> preclin.adverse_reaction
+    python -m pipeline.opentargets adverse-dates  # FAERS yearly counts -> when each reaction became a signal
 
 Loads direct associations by data source for the targets of every molecular
 entity with an industry-sponsored development program (preclin.moiety_target).
@@ -21,23 +24,48 @@ not diseases have none. `evidence` keeps, for the same targets and sources, each
 evidence item with its date, direction of effect, confidence and source detail
 (preclin.ot_evidence), and the targets' mouse mutant phenotypes
 (preclin.ot_mouse_phenotype).
+
+`pqtl` and `adverse` query the same release in place, in Google's public BigQuery copy (the colocalisation table
+alone is 16 GB), billed to the Google Cloud project $BIGQUERY_PROJECT with application-default credentials.
+`pqtl` keeps each cis-pQTL of a target's plasma protein that colocalises with a GWAS signal of a disease, with the
+sign of the effect ratio (does the allele raising the protein raise risk); `adverse` keeps each adverse reaction
+FAERS reports significantly often for one of our drugs, with the MONDO diseases the reaction is. `adverse-dates`
+dates the reactions the side-effect fact can reach (a reaction that is the disease of a stored evidence entry, or one
+at least 0.8 similar, of a drug on the entry's primary target): it counts their FAERS reports by the year the FDA
+received them (openFDA, preclin.faers_year_count) and keeps the first year the reports received by then met
+SIGNAL_METHOD's criterion (preclin.faers_signal). Counts already stored are not asked for again.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import hashlib
+import json
 import os
 import re
+import time
 from collections import defaultdict
 
+import pandas as pd
 import pyarrow.dataset as ds
 import requests
 from psycopg2.extras import Json, execute_values
 
-from pipeline import llm
+from pipeline import llm, throttle
 
 RELEASE = "26.09"
+BIGQUERY = "bigquery-public-data.open_targets_platform"  # the release in BigQuery; ot_release names it
+BIGQUERY_URL = "https://bigquery.googleapis.com/bigquery/v2/projects"
+H4_MIN = 0.8  # coloc posterior of one shared causal variant at which a pQTL and a GWAS signal colocalise
+OPENFDA_EVENTS = "https://api.fda.gov/drug/event.json"
+OPENFDA_PER_SECOND = 3.5  # openFDA without a key allows 240 requests a minute (and 1,000 a day)
+# A reaction becomes a signal once the reports received by the end of a year give at least SIGNAL_REPORTS reports
+# naming the drug and the reaction, a proportional reporting ratio of at least SIGNAL_PRR and a chi-squared (Yates) of
+# at least SIGNAL_CHI2 (Evans, Waller and Davis 2001).
+SIGNAL_METHOD, SIGNAL_REPORTS, SIGNAL_PRR, SIGNAL_CHI2 = "faers_signal@v1", 3, 2.0, 4.0
+# Open Targets gives QTL studies no publication date: each pQTL project's paper (PubMed id, year).
+PQTL_PUBLISHED = {"Sun_2018": ("29875488", 2018), "UKB_PPP_EUR": ("37794186", 2023)}
 CACHE = os.path.join(llm.REPO, ".cache", "opentargets", RELEASE)
 SOURCE_URL = f"https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/{RELEASE}/output"
 DATASETS = ("association_by_datasource_direct", "disease")  # the release datasets load reads
@@ -143,16 +171,60 @@ def fetch(_args) -> None:
         print(f"{dataset}: {len(names)} files -> {os.path.join(CACHE, dataset)}", flush=True)
 
 
+def entity_targets(cur) -> list[str]:
+    """The Ensembl ids of every entity target, the targets the loaders keep."""
+    cur.execute("""SELECT DISTINCT t.ensembl_id FROM preclin.moiety_target mt
+                   JOIN public.targets t ON t.id = mt.target_id WHERE t.ensembl_id IS NOT NULL""")
+    return [r[0] for r in cur.fetchall()]
+
+
 def release_and_targets(cur, name: str, datasets: list[str], metadata: dict) -> tuple[int, list[str]]:
     """Register the release behind `datasets` (by the sha256 of their cached files), and return it
-    with the Ensembl ids of every entity target, the targets the loaders keep."""
+    with the entity targets."""
     files = sorted(f for d in datasets for f in glob.glob(os.path.join(CACHE, d, "*.parquet")))
     digest = hashlib.sha256("".join(llm.sha256_file(f) for f in files).encode())
     release = llm.register_release(cur, name, RELEASE, SOURCE_URL, digest.hexdigest(),
                                    {"datasets": datasets, **metadata, "sha256_of": "concatenated per-file sha256"})
-    cur.execute("""SELECT DISTINCT t.ensembl_id FROM preclin.moiety_target mt
-                   JOIN public.targets t ON t.id = mt.target_id WHERE t.ensembl_id IS NOT NULL""")
-    return release, [r[0] for r in cur.fetchall()]
+    return release, entity_targets(cur)
+
+
+CAST = {"INTEGER": int, "FLOAT": float, "BOOLEAN": lambda v: v == "true"}
+
+
+def bigquery(sql: str) -> list[dict]:
+    """The rows of a standard-SQL query, run in $BIGQUERY_PROJECT with application-default credentials."""
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/bigquery"])
+    session = AuthorizedSession(credentials)
+    base = f"{BIGQUERY_URL}/{os.environ['BIGQUERY_PROJECT']}/queries"
+    r = session.post(base, json={"query": sql, "useLegacySql": False, "timeoutMs": 60000, "maxResults": 20000},
+                     timeout=120)
+    r.raise_for_status()
+    page, rows = r.json(), []
+    job = page["jobReference"]
+    while True:
+        if page.get("jobComplete"):
+            fields = page["schema"]["fields"]
+            rows += [{f["name"]: None if c["v"] is None else CAST.get(f["type"], str)(c["v"])
+                      for f, c in zip(fields, row["f"])} for row in page.get("rows", [])]
+            if not page.get("pageToken"):
+                return rows
+        r = session.get(f"{base}/{job['jobId']}", timeout=120,
+                        params={"location": job["location"], "timeoutMs": 60000, "maxResults": 20000,
+                                **({"pageToken": page["pageToken"]} if page.get("pageToken") else {})})
+        r.raise_for_status()
+        page = r.json()
+
+
+def bigquery_release(cur, name: str, rows: list[dict], metadata: dict) -> int:
+    """Register the rows a BigQuery load read (by the sha256 of their JSON), after checking the dataset is RELEASE."""
+    (found,) = (r["release"] for r in bigquery(f"SELECT release FROM `{BIGQUERY}.ot_release`"))
+    if found != RELEASE:
+        raise RuntimeError(f"{BIGQUERY} holds Open Targets {found}, not {RELEASE}")
+    digest = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+    return llm.register_release(cur, name, RELEASE, f"bigquery://{BIGQUERY}", digest,
+                                {**metadata, "sha256_of": "the rows read, as sorted-key JSON"})
 
 
 def load(_args) -> None:
@@ -280,10 +352,230 @@ def evidence(_args) -> None:
           f"undated={sum(r[6] is None for r in rows)}")
 
 
+def pqtl(_args) -> None:
+    """Each cis-pQTL of an entity target's plasma protein colocalising (H4 >= H4_MIN) with a GWAS signal of a disease,
+    once per disease the GWAS study is mapped to; a pair of signals colocalised twice keeps its higher H4."""
+    rows = bigquery(f"""
+        SELECT c.leftStudyLocusId AS gwas_locus_id, c.rightStudyLocusId AS pqtl_locus_id, d.element AS disease_id,
+               q.geneId AS ensembl_id, g.studyId AS gwas_study_id, g.pubmedId AS gwas_pmid,
+               g.publicationDate AS gwas_date, q.studyId AS pqtl_study_id, q.projectId AS pqtl_project, c.h4,
+               c.betaRatioSignAverage AS beta_ratio_sign
+        FROM `{BIGQUERY}.colocalisation_coloc` c
+        JOIN `{BIGQUERY}.credible_set` qc ON qc.studyLocusId = c.rightStudyLocusId AND qc.isTransQtl IS FALSE
+        JOIN `{BIGQUERY}.study` q ON q.studyId = qc.studyId
+        JOIN `{BIGQUERY}.credible_set` gc ON gc.studyLocusId = c.leftStudyLocusId AND gc.studyType = 'gwas'
+        JOIN `{BIGQUERY}.study` g ON g.studyId = gc.studyId, UNNEST(g.diseaseIds.list) d
+        WHERE c.rightStudyType = 'pqtl' AND c.h4 >= {H4_MIN} AND c.betaRatioSignAverage != 0""")
+    unknown = {r["pqtl_project"] for r in rows} - set(PQTL_PUBLISHED)
+    if unknown:
+        raise RuntimeError(f"pQTL projects without a publication year in PQTL_PUBLISHED: {sorted(unknown)}")
+    with llm.connect() as conn, conn.cursor() as cur:
+        targets = set(entity_targets(cur))
+        release = bigquery_release(cur, "open_targets_pqtl_coloc", rows, {"h4_min": H4_MIN,
+                                                                          "pqtl_published": PQTL_PUBLISHED})
+        best: dict = {}
+        for r in rows:
+            if r["ensembl_id"] not in targets:
+                continue
+            key = (r["gwas_locus_id"], r["pqtl_locus_id"], curie(r["disease_id"]))
+            if key not in best or r["h4"] > best[key][10]:
+                best[key] = (*key, r["ensembl_id"], r["gwas_study_id"], r["gwas_pmid"],
+                             int(r["gwas_date"][:4]) if r["gwas_date"] else None, r["pqtl_study_id"],
+                             r["pqtl_project"], PQTL_PUBLISHED[r["pqtl_project"]][1], r["h4"], r["beta_ratio_sign"],
+                             release)
+        cur.execute("DELETE FROM preclin.pqtl_coloc")
+        execute_values(cur, """INSERT INTO preclin.pqtl_coloc
+              (gwas_locus_id, pqtl_locus_id, disease_id, ensembl_id, gwas_study_id, gwas_pmid, gwas_year,
+               pqtl_study_id, pqtl_project, pqtl_year, h4, beta_ratio_sign, source_release_id) VALUES %s""",
+                       list(best.values()), page_size=5000)
+        conn.commit()
+    print(f"release={RELEASE} colocalisations={len(rows)} kept={len(best)} "
+          f"genes={len({v[3] for v in best.values()})}")
+
+
+def adverse(_args) -> None:
+    """Each adverse reaction FAERS reports significantly often for one of our drugs, with the MONDO diseases it is: the
+    terms whose label or synonym is its MedDRA preferred term (the drug-level reactions carry no MedDRA code)."""
+    rows = bigquery(f"""SELECT chembl_id, event, count AS reports, llr, critval
+                        FROM `{BIGQUERY}.openfda_significant_adverse_drug_reactions`""")
+    with llm.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT parent_chembl_id FROM preclin.chembl_moiety")
+        ours = {r[0] for r in cur.fetchall()}
+        cur.execute("""SELECT lower(n), term_id FROM preclin.ontology_term,
+                              unnest(array_append(synonyms, label)) n
+                       WHERE ontology = 'MONDO' AND NOT is_obsolete""")
+        by_name = defaultdict(set)
+        for name, term in cur.fetchall():
+            by_name[name].add(term)
+        release = bigquery_release(cur, "open_targets_openfda", rows, {})
+        kept = [(r["chembl_id"], r["event"], r["reports"], r["llr"], r["critval"],
+                 sorted(by_name.get(r["event"].lower(), ())), release) for r in rows if r["chembl_id"] in ours]
+        cur.execute("DELETE FROM preclin.adverse_reaction")
+        execute_values(cur, """INSERT INTO preclin.adverse_reaction
+              (chembl_id, event, reports, llr, critval, mondo_ids, source_release_id) VALUES %s""",
+                       kept, page_size=5000)
+        conn.commit()
+    print(f"release={RELEASE} reactions={len(rows)} ours={len(kept)} drugs={len({k[0] for k in kept})} "
+          f"diseases={sum(bool(k[5]) for k in kept)}")
+
+
+def signal(pair: dict, drug: dict, reaction: dict, total: dict, through: int) -> tuple:
+    """(signal_year, reports, prr, chi2) of a drug and reaction from yearly report counts ({year: reports}): the first
+    year whose cumulative counts meet the criterion, with its statistics; with no such year by `through`, a null year
+    and the statistics at `through`."""
+    a = b = c = n = 0
+    stats = (None, 0, None, None)
+    for year in range(min((*pair, *drug, *reaction, *total), default=through), through + 1):
+        a, n = a + pair.get(year, 0), n + total.get(year, 0)
+        b, c = b + drug.get(year, 0) - pair.get(year, 0), c + reaction.get(year, 0) - pair.get(year, 0)
+        d = n - a - b - c
+        prr = (a / (a + b)) / (c / (c + d)) if a and c and c + d else None
+        chi2 = (n * max(abs(a * d - b * c) - n / 2, 0) ** 2 / ((a + b) * (c + d) * (a + c) * (b + d))
+                if a and (a + b) * (c + d) * (a + c) * (b + d) else None)
+        stats = (None, a, prr, chi2)
+        if a >= SIGNAL_REPORTS and prr is not None and prr >= SIGNAL_PRR and chi2 is not None and chi2 >= SIGNAL_CHI2:
+            return year, a, prr, chi2
+    return stats
+
+
+def faers_years(search: str | None) -> dict[int, int]:
+    """FAERS reports by the year the FDA received them, for an openFDA drug/event search (None: every report)."""
+    params = {"count": "receivedate", **({"search": search} if search else {})}
+    for attempt in range(6):
+        throttle.wait("openfda", OPENFDA_PER_SECOND)
+        r = requests.get(OPENFDA_EVENTS, params=params, timeout=120)
+        if r.status_code == 404:  # openFDA's answer to a search with no reports
+            return {}
+        if r.status_code in (429, 500, 502, 503) and attempt < 5:
+            print(f"openFDA {r.status_code}; waiting {30 * (attempt + 1)} s", flush=True)
+            time.sleep(30 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        out: dict[int, int] = defaultdict(int)
+        for row in r.json()["results"]:
+            out[int(row["time"][:4])] += row["count"]
+        return dict(out)
+    raise RuntimeError("openFDA kept failing")
+
+
+def adverse_pairs() -> set[tuple[int, str]]:
+    """The (drug, reaction) pairs the side-effect fact can reach (report.section3.Evidence.side_effect): a significant
+    reaction of an entity on a stored evidence entry's primary target, approved before the entry and developed for no
+    disease related to the entry's (Lin RELATED), that is the entry's disease or one at least CLOSE similar."""
+    from report import frame
+    from report.section3 import CLOSE, RELATED, approval_dates, neighbourhood
+    progs = frame.programs()
+    p = progs.set_index("program_id")
+    first = pd.concat([pd.to_datetime(p.moiety_first_fda_approval), approval_dates(p, p.approved.eq("yes"))],
+                      axis=1).min(axis=1)
+    approved = first.groupby(p.moiety_id).min().dropna().to_dict()
+    developed = progs.dropna(subset=["mondo_id"]).groupby("moiety_id").mondo_id.apply(frozenset).to_dict()
+    reach = frame.query("""
+        SELECT DISTINCT e.moiety_id, e.mondo_id, e.entry_date, ot.moiety_id AS other
+        FROM preclin.evidence_entry e
+        JOIN preclin.moiety_target mt ON mt.moiety_id = e.moiety_id AND mt.is_primary
+        JOIN preclin.moiety_target ot ON ot.target_id = mt.target_id AND ot.is_primary AND ot.moiety_id <> e.moiety_id
+        JOIN preclin.moiety o ON o.moiety_id = ot.moiety_id AND o.target_kind = 'human_protein'
+        WHERE e.has_target_disease""")
+    reactions = defaultdict(list)
+    ae = frame.query("""SELECT DISTINCT cm.moiety_id, a.event, m AS mondo_id FROM preclin.adverse_reaction a
+                        JOIN preclin.chembl_moiety cm ON cm.parent_chembl_id = a.chembl_id, unnest(a.mondo_ids) m""")
+    for moiety, event, mondo in ae.itertuples(index=False):
+        reactions[moiety].append((event, mondo))
+    nb = neighbourhood()
+    return {(other, event) for _, disease, entry, other in reach.itertuples(index=False)
+            if approved.get(other, pd.Timestamp.max) < pd.Timestamp(entry)
+            and not developed.get(other, frozenset()) & nb.terms(disease, RELATED)
+            for event, mondo in reactions.get(other, ()) if mondo in nb.terms(disease, CLOSE)}
+
+
+def drug_searches(cur, moieties: list[int]) -> dict[int, str]:
+    """Each drug's openFDA search: a report naming it by one of the UNIIs of its entity and their salts and forms, by its
+    name as a generic name, or by its name as the product a report gives (a drug openFDA's labels no longer list, such
+    as a withdrawn one, has no UNII in the reports, and a salt missing from preclin.unii_parent is found by name)."""
+    cur.execute("""SELECT m.moiety_id, m.name, array_remove(array_append(array_agg(p.unii), m.unii), NULL)
+                   FROM preclin.moiety m LEFT JOIN preclin.unii_parent p ON p.parent_unii = m.unii
+                   WHERE m.moiety_id = ANY(%s) GROUP BY m.moiety_id""", (moieties,))
+    return {m: "(" + " ".join([*(f'patient.drug.openfda.unii:"{u}"' for u in sorted(set(uniis))),
+                                f'patient.drug.openfda.generic_name:"{name}"', f'patient.drug.medicinalproduct:"{name}"'])
+               + ")" for m, name, uniis in cur.fetchall()}
+
+
+def reaction_search(event: str) -> str:
+    return f'patient.reaction.reactionmeddrapt.exact:"{event.upper()}"'
+
+
+def adverse_dates(_args) -> None:
+    """Count the FAERS reports of every pair the side-effect fact can reach, its drug, its reaction and all reports, by
+    year received, for searches not stored yet; then date every such pair by SIGNAL_METHOD, and drop the stored counts of
+    drug and pair searches no pair uses any more."""
+    through = datetime.date.today().year - 1  # the last whole year received
+    pairs = adverse_pairs()
+    with llm.connect() as conn, conn.cursor() as cur:
+        searches = drug_searches(cur, sorted({m for m, _ in pairs}))
+        release = llm.register_release(cur, "openfda_drug_event", datetime.date.today().isoformat(), OPENFDA_EVENTS,
+                                       hashlib.sha256(json.dumps(sorted(pairs)).encode()).hexdigest(),
+                                       {"count": "receivedate", "pairs": len(pairs)})
+        conn.commit()  # no transaction stays open through the openFDA calls
+
+    def ask(queries: list[tuple]) -> None:
+        with llm.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT query_kind, subject_key FROM preclin.faers_year_count")
+            have = set(cur.fetchall())
+            conn.commit()
+        todo = [q for q in queries if q[:2] not in have]
+        print(f"{len(queries)} searches, {len(todo)} to ask", flush=True)
+        for i, (kind, key, moiety, event, search) in enumerate(todo):
+            years = faers_years(search)
+            # A search is stored whole, in its own transaction, so an interrupted run resumes after the last one
+            # stored; one with no reports keeps a single row of year 0 and 0 reports marking it asked.
+            rows = [(kind, key, moiety, event, y, n, release) for y, n in sorted(years.items())] or \
+                   [(kind, key, moiety, event, 0, 0, release)]
+            with llm.connect() as conn, conn.cursor() as cur:
+                execute_values(cur, """INSERT INTO preclin.faers_year_count
+                      (query_kind, subject_key, moiety_id, event, year, reports, source_release_id) VALUES %s""", rows)
+                conn.commit()
+            if (i + 1) % 50 == 0:
+                print(f"{i + 1}/{len(todo)}", flush=True)
+
+    drug = searches
+    pair = {(m, e): f"{drug[m]} AND {reaction_search(e)}" for m, e in pairs}
+    ask([("all", "", None, None, None)] + [("drug", q, m, None, q) for m, q in sorted(drug.items())]
+        + [("reaction", e, None, e, reaction_search(e)) for e in sorted({e for _, e in pairs})]
+        + [("pair", q, m, e, q) for (m, e), q in sorted(pair.items())])
+    with llm.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT query_kind, subject_key, year, reports FROM preclin.faers_year_count WHERE year > 0")
+        counts: dict = defaultdict(dict)
+        for kind, key, year, n in cur.fetchall():
+            counts[(kind, key)][year] = n
+        method = llm.record_method(
+            cur, SIGNAL_METHOD, "FAERS signal year",
+            "First year whose FAERS reports received by its end (openFDA receivedate) give a drug and reaction at "
+            "least the minimum reports, proportional reporting ratio and Yates chi-squared (Evans 2001)",
+            ["preclin.faers_year_count"], {"min_reports": SIGNAL_REPORTS, "min_prr": SIGNAL_PRR,
+                                           "min_chi2": SIGNAL_CHI2, "through": through})
+        rows = []
+        for m, e in sorted(pairs):
+            year, reports, prr, chi2 = signal(counts[("pair", pair[(m, e)])], counts[("drug", drug[m])],
+                                              counts[("reaction", e)], counts[("all", "")], through)
+            rows.append((m, e, year, through, reports, prr, chi2, method))
+        cur.execute("""DELETE FROM preclin.faers_year_count WHERE (query_kind = 'drug' AND subject_key <> ALL(%s))
+                                                                 OR (query_kind = 'pair' AND subject_key <> ALL(%s))""",
+                    (list(drug.values()), list(pair.values())))
+        cur.execute("DELETE FROM preclin.faers_signal")
+        execute_values(cur, """INSERT INTO preclin.faers_signal
+              (moiety_id, event, signal_year, dated_through, reports, prr, chi2, method_id) VALUES %s""", rows)
+        conn.commit()
+    dated = [r for r in rows if r[2] is not None]
+    print(f"dated {len(rows)} pairs through {through}: {len(dated)} signals, first years "
+          f"{min((r[2] for r in dated), default=None)}-{max((r[2] for r in dated), default=None)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name, fn in [("fetch", fetch), ("load", load), ("evidence", evidence), ("dates", dates)]:
+    for name, fn in [("fetch", fetch), ("load", load), ("evidence", evidence), ("dates", dates), ("pqtl", pqtl),
+                     ("adverse", adverse), ("adverse-dates", adverse_dates)]:
         sub.add_parser(name).set_defaults(fn=fn)
     args = parser.parse_args()
     args.fn(args)
